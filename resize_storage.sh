@@ -10,6 +10,8 @@
 
 # Last updated: 05/03/2019
 
+# Modified by andrey on 9/9/19: support for NVMe volumes, exit on error, run at most once.
+
 #set -x
 set -e
 
@@ -27,7 +29,7 @@ if [ -f "/tmp/resize_storage_script.sh" ]; then
         exit 1
 fi
 
-blockDeviceMapping=$(/usr/bin/curl http://169.254.169.254/latest/meta-data/block-device-mapping/ | xargs)
+blockDeviceMapping=$(/usr/bin/curl -s http://169.254.169.254/latest/meta-data/block-device-mapping/ | xargs)
 if [[ $blockDeviceMapping =~ ebs ]]; then
         echo "INFO: EBS volume(s) detected on this node"
 else
@@ -42,6 +44,32 @@ if [ $is_master != "true" ]; then
 fi
 
 RESIZE_STORAGE_SCRIPT=$(cat <<EOF1
+        #!/bin/bash
+        # script generated during bootstrap on $(date)
+        set -e
+
+        # prevent from running concurrently
+        prog="resize_storage"
+        pidFile="/tmp/\$prog.pid"
+        # only run if no PID file present
+        if [[ -f \$pidFile ]]; then
+          echo "\$prog: already running - see: \$pidFile" >&2
+          exit 7
+        else
+          #write pid to pidFile
+          echo \$\$ > \$pidFile
+          echo "\$prog: created \$pidFile for process \${cat \$pidFile}"
+        fi
+        # delete PID file on exit
+        cleanup()
+        {
+          exitCode=\$?
+          echo "\$prog: exiting with code \$exitCode and deleting \$pidFile for process \$(cat \$pidFile)"
+          rm -f \$pidFile
+          exit \$exitCode
+        }
+        trap cleanup EXIT
+
 
         while [ "\$(sed '/localInstance {/{:1; /}/!{N; b1}; /nodeProvision/p}; d' /emr/instance-controller/lib/info/job-flow-state.txt | sed '/nodeProvisionCheckinRecord {/{:1; /}/!{N; b1}; /status/p}; d' | awk '/SUCCESSFUL/' | xargs)" != "status: SUCCESSFUL" ];
         do
@@ -93,30 +121,41 @@ RESIZE_STORAGE_SCRIPT=$(cat <<EOF1
                             renamedDisk=\${renamedDisk/[1-9]/}
                             searchDisk=\$renamedDisk
                         fi
-                            volumeId=\$(echo \$blockDeviceMapping | jq '.[] | select(.DeviceName=='"\"\$searchDisk\""') | .Ebs.VolumeId')
+                        volumeId=\$(echo \$blockDeviceMapping | jq '.[] | select(.DeviceName=='"\"\$searchDisk\""') | .Ebs.VolumeId')
                         if [[ \$volumeId = "" ]]; then
-                            echo "WARN: Not able to find the EBS volume ID for \$disk as it might be an instance store volume. Only EBS volumes can be resized."
+                                volumeId=\$(sudo /sbin/ebsnvme-id \$disk | grep "Volume ID" | awk '{print \$3}')
+                        fi
+                        if [[ \$volumeId = "" ]]; then
+                             echo "WARN: Not able to find the EBS volume ID for \$disk as it might be an instance store volume. Only EBS volumes can be resized."
                             continue
                         fi
                         volumeId=\${volumeId//\"/}
 
                         #Resizing the volume
                         targetCapacity=\$(echo "scale=2;$scalingFactor/100*\$diskSize" | bc -l)
-            targetCapacity=\$(echo \$targetCapacity+\$diskSize | bc -l | awk '{print int(\$1)}')
+                        targetCapacity=\$(echo \$targetCapacity+\$diskSize | bc -l | awk '{print int(\$1)}')
                         aws ec2 modify-volume --region \$region --volume-id \$volumeId --size \$targetCapacity
                         volumeStatus=""
                         while [[ \$volumeStatus != "optimizing" && \$volumeStatus != "completed" ]]
                         do
-                                sleep 5
+                                sleep 60
                                 volumeStatus=\$(aws ec2 describe-volumes-modifications --region \$region --volume-id \$volumeId | jq .VolumesModifications[].ModificationState)
                                 volumeStatus=\${volumeStatus//\"/}
+                                volumeProgress=\$(aws ec2 describe-volumes-modifications --region \$region --volume-id \$volumeId | jq .VolumesModifications[].ModificationState)
+                                echo "Modifying volume... status=\$volumeStatus, progress=\$volumeProgress"
                         done
 
 
                         echo "Expanding the partition..."
-                        partition=\${disk/[1-9]*/}
-                        partitionNumber=\${disk/\/dev\/xv[a-z][a-z]/}
-                        partitionNumber=\${partitionNumber/\/dev\/mapper\/xv[a-z][a-z]/}
+                        if [[ ! \$disk =~ "nvme" ]]; then
+                            partition=\${disk/p[0-9]*/}
+                            partition=\${disk/[1-9]*/}
+                            partitionNumber=\${disk/\/dev\/xv[a-z][a-z]/}
+                            partitionNumber=\${partitionNumber/\/dev\/mapper\/xv[a-z][a-z]/}
+                        else
+                            partition=\${disk/p[0-9]*/}
+                            partitionNumber=\${disk/\/dev\/nvme[0-9]n[0-9]p/}
+                        fi
                         if [[ -z "\${partitionNumber// }" ]]; then
                             echo "No partitioning. Skipping growpart..."
                         else
@@ -124,7 +163,7 @@ RESIZE_STORAGE_SCRIPT=$(cat <<EOF1
                         fi
                         echo "Resizing the filesystem..."
                         fileSystemTypes="ext4|XFS"
-                        
+
                         #check for dm- encrypted EMR device.
                         isLUKS=\$(sudo ls -la \$disk | awk '{print \$11}')
                         if [[ \$isLUKS =~ "dm-" ]]; then
@@ -135,14 +174,16 @@ RESIZE_STORAGE_SCRIPT=$(cat <<EOF1
                         else
                             isLUKS=\$disk
                         fi
-                        
-            detectedFileSystem=\$(sudo file -s \$isLUKS | grep -oE "(\$fileSystemTypes)")
 
-            if [ \$detectedFileSystem == "XFS" ]; then
-                    sudo xfs_growfs -d \$mountPoint
-            else
-                    sudo resize2fs \$disk
-            fi
+                        detectedFileSystem=\$(sudo file -s \$isLUKS | grep -oE "(\$fileSystemTypes)")
+
+                        if [ \$detectedFileSystem == "XFS" ]; then
+                                sudo xfs_growfs -d \$mountPoint
+                        else
+                                sudo resize2fs \$disk
+                        fi
+
+                        echo "Finished resizing volume \$disk"
                 else
                         echo "Resize not needed for \$disk"
                 fi
