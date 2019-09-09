@@ -58,13 +58,13 @@ RESIZE_STORAGE_SCRIPT=$(cat <<EOF1
         else
           #write pid to pidFile
           echo \$\$ > \$pidFile
-          echo "\$prog: created \$pidFile for process \${cat \$pidFile}"
+          echo "\$prog: created \$pidFile"
         fi
         # delete PID file on exit
         cleanup()
         {
           exitCode=\$?
-          echo "\$prog: exiting with code \$exitCode and deleting \$pidFile for process \$(cat \$pidFile)"
+          echo "\$prog: exiting with code \$exitCode and deleting \$pidFile"
           rm -f \$pidFile
           exit \$exitCode
         }
@@ -141,7 +141,7 @@ RESIZE_STORAGE_SCRIPT=$(cat <<EOF1
                                 sleep 60
                                 volumeStatus=\$(aws ec2 describe-volumes-modifications --region \$region --volume-id \$volumeId | jq .VolumesModifications[].ModificationState)
                                 volumeStatus=\${volumeStatus//\"/}
-                                volumeProgress=\$(aws ec2 describe-volumes-modifications --region \$region --volume-id \$volumeId | jq .VolumesModifications[].ModificationState)
+                                volumeProgress=\$(aws ec2 describe-volumes-modifications --region \$region --volume-id \$volumeId | jq .VolumesModifications[].Progress)
                                 echo "Modifying volume... status=\$volumeStatus, progress=\$volumeProgress"
                         done
 
