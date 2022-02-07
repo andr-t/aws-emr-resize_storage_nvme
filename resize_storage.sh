@@ -8,18 +8,42 @@
 # Author: Jigar Mistry jimistry@amazon.com
 # Modified by: Chris Goetz goetzc@amazon.com (Added support for LUKS encrypted volumes)
 
-# Last updated: 05/03/2019
+# Last updated: 2022-02-07
 
 # Modified by andrey on 9/9/19: support for NVMe volumes, exit on error, run at most once.
 
-#set -x
-set -e
+# Modifies by drconopoima on 2022-02-07: Support for token metadata, help function.
 
-if [[ $# -eq 2 && $1 == "--scaling-factor" && $2 =~ [1-9] ]]; then
-        scalingFactor=$2
+## Section Script Identification
+readonly SCRIPT_CALLNAME="${0}"
+SCRIPT_NAME="$(basename -- "${SCRIPT_CALLNAME}" 2>/dev/null)"
+readonly SCRIPT_NAME
+readonly SCRIPT_VERSION="2022-02-07"
+#set -x
+set -Eeuo pipefail
+printf "%s (v%s)\n" "${SCRIPT_NAME}" "${SCRIPT_VERSION}"
+
+# Section HELP
+function usage {
+        echo "Usage: ${SCRIPT_NAME} --help|{--scaling-factor INCREASE_PERCENTAGE}"
+}
+readonly -f usage
+function help {
+        printf "         --help: Show this message\n"
+        echo "         --scaling-factor: percentage by which to increase the disk size when usage exceeds 90%."
+}
+readonly -f help
+
+if [[ $# -eq 1 && $1 == "--help" ]]; then
+        usage
+        help
+        exit 0
+elif [[ $# -eq 2 && $1 == "--scaling-factor" && $2 =~ [1-9] ]]; then
+        readonly scalingFactor=$2
 else
         echo "Failed to run the script!"
-        echo "Usage: resize_storage.sh --scaling-factor <percentage by which to increase the size when usage exceeds 90%>"
+        usage
+        help
         exit 1
 fi
 
@@ -28,8 +52,8 @@ if [ -f "/tmp/resize_storage_script.sh" ]; then
         echo "ERROR: This script has already been installed on this system. Please remove the script in /tmp to reconfigure."
         exit 1
 fi
-
-blockDeviceMapping=$(/usr/bin/curl -s http://169.254.169.254/latest/meta-data/block-device-mapping/ | xargs)
+TOKEN=$(/usr/bin/curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+blockDeviceMapping=$(/usr/bin/curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/block-device-mapping/ | xargs)
 if [[ $blockDeviceMapping =~ ebs ]]; then
         echo "INFO: EBS volume(s) detected on this node"
 else
@@ -90,8 +114,8 @@ RESIZE_STORAGE_SCRIPT=$(cat <<EOF1
         if [ $is_master == "true" ]; then
                 mntString=\$mntString"|xvda1"
         fi
-
-        az=\$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+        TOKEN=\$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+        az=\$(curl -s -H "X-aws-ec2-metadata-token: \\\$TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
         region=\$(echo \$az | sed 's/[a-z]\$//')
 
         #Looping through output of "df -h" and checking usage
@@ -105,7 +129,7 @@ RESIZE_STORAGE_SCRIPT=$(cat <<EOF1
                         echo "Attempting to resize volume \$disk..."
 
 
-                        instanceId=\$(/usr/bin/curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                        instanceId=\$(/usr/bin/curl -s -H "X-aws-ec2-metadata-token: \\\$TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
                         blockDeviceMapping=\$(aws ec2 describe-instances --region \$region --instance-ids \$instanceId | jq .Reservations[].Instances[].BlockDeviceMappings)
 
                         #Renaming the disk name since EC2 renames the disk when initially attached
